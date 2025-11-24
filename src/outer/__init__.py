@@ -19,7 +19,7 @@ from typing import Any
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     Button,
     Footer,
@@ -28,6 +28,9 @@ from textual.widgets import (
     Label,
     RichLog,
     Static,
+    TabbedContent,
+    TabPane,
+    TextArea,
 )
 from textual.screen import ModalScreen
 
@@ -260,10 +263,17 @@ class OuterApp(App):
         width: 1fr;
     }
 
-    #output {
+    #output, #logs {
         height: 1fr;
-        border: solid $primary;
-        padding: 0 1;
+    }
+
+    TabbedContent {
+        height: 1fr;
+    }
+
+    TabPane {
+        height: 1fr;
+        padding: 0;
     }
 
     #status-panel {
@@ -330,6 +340,8 @@ class OuterApp(App):
         Binding("6", "run_execute", "Run"),
         Binding("r", "refresh", "Refresh"),
         Binding("c", "clear_output", "Clear"),
+        Binding("l", "show_logs", "Logs"),
+        Binding("o", "show_output", "Output"),
     ]
 
     def __init__(self):
@@ -365,7 +377,11 @@ class OuterApp(App):
                     yield Static("Cost: $0.0000", id="info-cost", classes="info-item")
                     yield Static("Turns: 0", id="info-turns", classes="info-item")
             with Vertical(id="main"):
-                yield RichLog(id="output", highlight=True, markup=True)
+                with TabbedContent():
+                    with TabPane("Output", id="tab-output"):
+                        yield RichLog(id="output", highlight=True, markup=True)
+                    with TabPane("Logs", id="tab-logs"):
+                        yield TextArea(id="logs", read_only=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -422,6 +438,14 @@ class OuterApp(App):
         """Write a message to the output log."""
         self.query_one("#output", RichLog).write(message)
 
+    def log_debug(self, message: str) -> None:
+        """Write a message to the debug logs (selectable text)."""
+        # Strip Rich markup for plain text display
+        import re
+        plain = re.sub(r'\[/?[^\]]+\]', '', message)
+        logs = self.query_one("#logs", TextArea)
+        logs.insert(plain, logs.document.end)
+
     def update_info(self, cost: float, turns: int) -> None:
         """Update session info display."""
         self.total_cost += cost
@@ -455,6 +479,14 @@ class OuterApp(App):
     def action_clear_output(self) -> None:
         """Clear the output log."""
         self.query_one("#output", RichLog).clear()
+
+    def action_show_logs(self) -> None:
+        """Switch to logs tab."""
+        self.query_one(TabbedContent).active = "tab-logs"
+
+    def action_show_output(self) -> None:
+        """Switch to output tab."""
+        self.query_one(TabbedContent).active = "tab-output"
 
     def action_run_plan(self) -> None:
         """Start the planning phase."""
@@ -618,30 +650,71 @@ class OuterApp(App):
 
     async def _run_claude(self, prompt: str) -> dict[str, Any]:
         """Run a Claude Code session and stream output to the log."""
+        import os
+        import sys
+        import tempfile
+
+        self.log_debug(f"[dim]Starting Claude query...[/dim]\n")
+
+        # Capture stderr to a temp file for logging
+        stderr_capture = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.log')
+
+        # Save original stderr fd and redirect fd 2 to capture file
+        original_stderr_fd = os.dup(2)
+        os.dup2(stderr_capture.fileno(), 2)
+
         options = ClaudeCodeOptions(
             cwd=str(self.cwd),
             permission_mode="bypassPermissions",
+            debug_stderr=stderr_capture,
         )
 
         result_info: dict[str, Any] = {}
         output = self.query_one("#output", RichLog)
 
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        output.write(block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        output.write(f"[dim]> {block.name}[/dim]")
-            elif isinstance(message, ResultMessage):
-                result_info = {
-                    "duration_ms": message.duration_ms,
-                    "num_turns": message.num_turns,
-                    "total_cost_usd": message.total_cost_usd,
-                    "session_id": message.session_id,
-                    "is_error": message.is_error,
-                }
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            output.write(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            output.write(f"[dim]> {block.name}[/dim]")
+                elif isinstance(message, ResultMessage):
+                    result_info = {
+                        "duration_ms": message.duration_ms,
+                        "num_turns": message.num_turns,
+                        "total_cost_usd": message.total_cost_usd,
+                        "session_id": message.session_id,
+                        "is_error": message.is_error,
+                    }
+                    self.log_debug(f"[dim]Session: {message.session_id}[/dim]\n")
+                    self.log_debug(f"[dim]Duration: {message.duration_ms}ms[/dim]\n")
+        except Exception as e:
+            output.write(f"\n[red]Error: {e}[/red]\n")
+            self.log_debug(f"[red]Error: {e}[/red]\n")
+            result_info = {"is_error": True}
+        finally:
+            # Restore original stderr
+            os.dup2(original_stderr_fd, 2)
+            os.close(original_stderr_fd)
 
+            # Read captured stderr and log it
+            stderr_capture.flush()
+            stderr_capture.seek(0)
+            stderr_content = stderr_capture.read()
+            stderr_capture.close()
+
+            if stderr_content:
+                self.log_debug(f"[yellow]Stderr output:[/yellow]\n{stderr_content}\n")
+
+            # Clean up temp file
+            try:
+                os.unlink(stderr_capture.name)
+            except:
+                pass
+
+        self.log_debug(f"[dim]Query complete.[/dim]\n")
         return result_info
 
 
