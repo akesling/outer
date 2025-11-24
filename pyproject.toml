@@ -8,6 +8,7 @@ dependencies = [
     "claude-code-sdk>=0.0.25",
     "click>=8.3.1",
     "rich>=14.2.0",
+    "textual>=6.6.0",
 ]
 
 [project.scripts]

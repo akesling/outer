@@ -16,9 +16,20 @@ import re
 from pathlib import Path
 from typing import Any
 
-import click
-from rich.console import Console
-from rich.panel import Panel
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Label,
+    RichLog,
+    Static,
+)
+from textual.screen import ModalScreen
 
 from claude_code_sdk import (
     query,
@@ -29,8 +40,10 @@ from claude_code_sdk import (
     AssistantMessage,
 )
 
-console = Console()
 
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
 def slugify(name: str) -> str:
     """Convert a name to a slug for filenames."""
@@ -52,23 +65,19 @@ def find_planning_files(cwd: Path) -> dict[str, Path | None]:
     if not docs.exists():
         return result
 
-    # Find architecture file
     for f in docs.glob("*_ARCHITECTURE.md"):
         result["architecture"] = f
         break
 
-    # Find roadmap file
     for f in docs.glob("*_ROADMAP.md"):
         result["roadmap"] = f
         break
 
-    # Find phase index
     if phases_dir.exists():
         for f in phases_dir.glob("*_PHASE_INDEX.md"):
             result["phase_index"] = f
             break
 
-    # Find resume prompt
     for f in docs.glob("*_RESUME_PROMPT.md"):
         result["resume_prompt"] = f
         break
@@ -81,7 +90,6 @@ def get_slug_from_files(files: dict[str, Path | None]) -> str | None:
     for key in ["architecture", "roadmap", "resume_prompt"]:
         if files[key]:
             name = files[key].stem
-            # Remove the suffix to get the slug
             for suffix in ["_ARCHITECTURE", "_ROADMAP", "_RESUME_PROMPT"]:
                 if name.endswith(suffix):
                     return name[:-len(suffix)]
@@ -92,39 +100,9 @@ def get_slug_from_files(files: dict[str, Path | None]) -> str | None:
     return None
 
 
-async def run_claude(
-    prompt: str,
-    cwd: Path,
-    max_turns: int | None = None,
-) -> dict[str, Any]:
-    """Run a Claude Code session and stream output."""
-    options = ClaudeCodeOptions(
-        cwd=str(cwd),
-        max_turns=max_turns,
-        permission_mode="bypassPermissions",
-    )
-
-    result_info: dict[str, Any] = {}
-
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    console.print(block.text, end="")
-                elif isinstance(block, ToolUseBlock):
-                    console.print(f"\n[dim]> {block.name}[/dim]")
-        elif isinstance(message, ResultMessage):
-            result_info = {
-                "duration_ms": message.duration_ms,
-                "num_turns": message.num_turns,
-                "total_cost_usd": message.total_cost_usd,
-                "session_id": message.session_id,
-                "is_error": message.is_error,
-            }
-
-    console.print()
-    return result_info
-
+# ============================================================================
+# Prompt Templates
+# ============================================================================
 
 PROMPTS = {
     "architecture": """Design and write a full architecture plan for: {description}
@@ -200,269 +178,476 @@ Goal: paste into fresh Claude Code, work happens automatically.""",
 }
 
 
-@click.group()
-def cli():
-    """Outer - Meta-workflow orchestrator for Claude Code planning sessions."""
-    pass
+# ============================================================================
+# Modal Screens
+# ============================================================================
 
+class PlanInputScreen(ModalScreen[str | None]):
+    """Modal screen for entering plan description."""
 
-@cli.command()
-@click.argument("description")
-@click.option("--slug", "-s", help="Custom slug for filenames (default: derived from description)")
-def plan(description: str, slug: str | None) -> None:
-    """Phase 1: Generate architecture document from a description."""
-    cwd = Path.cwd()
-
-    # Create docs directory
-    docs = cwd / "docs"
-    docs.mkdir(exist_ok=True)
-
-    project_slug = slug or slugify(description)[:30]
-
-    prompt = PROMPTS["architecture"].format(
-        description=description,
-        slug=project_slug,
-    )
-
-    console.print(Panel(
-        f"[yellow]Planning:[/yellow] {description}\n"
-        f"[dim]Slug: {project_slug}[/dim]",
-        title="Phase 1: Architecture",
-    ))
-    console.print()
-
-    async def run():
-        info = await run_claude(prompt, cwd)
-        console.print(Panel(
-            f"[green]Architecture complete[/green]\n\n"
-            f"Output: docs/{project_slug}_ARCHITECTURE.md\n"
-            f"Cost: ${info.get('total_cost_usd', 0):.4f}\n\n"
-            "[dim]Review and edit, then run:[/dim] outer roadmap",
-            title="Done",
-        ))
-
-    asyncio.run(run())
-
-
-@cli.command()
-def roadmap() -> None:
-    """Phase 2: Generate implementation roadmap from architecture."""
-    cwd = Path.cwd()
-    files = find_planning_files(cwd)
-
-    if not files["architecture"]:
-        console.print("[red]No architecture file found in docs/[/red]")
-        console.print("Run 'outer plan \"description\"' first.")
-        raise SystemExit(1)
-
-    slug = get_slug_from_files(files)
-
-    prompt = PROMPTS["roadmap"].format(
-        arch_path=files["architecture"].relative_to(cwd),
-        slug=slug,
-    )
-
-    console.print(Panel(
-        f"[yellow]Reading:[/yellow] {files['architecture'].name}",
-        title="Phase 2: Roadmap",
-    ))
-    console.print()
-
-    async def run():
-        info = await run_claude(prompt, cwd)
-        console.print(Panel(
-            f"[green]Roadmap complete[/green]\n\n"
-            f"Output: docs/{slug}_ROADMAP.md\n"
-            f"Cost: ${info.get('total_cost_usd', 0):.4f}\n\n"
-            "[dim]Review and edit, then run:[/dim] outer phases",
-            title="Done",
-        ))
-
-    asyncio.run(run())
-
-
-@cli.command()
-def phases() -> None:
-    """Phase 3: Generate detailed phase planning files."""
-    cwd = Path.cwd()
-    files = find_planning_files(cwd)
-
-    if not files["roadmap"]:
-        console.print("[red]No roadmap file found in docs/[/red]")
-        console.print("Run 'outer roadmap' first.")
-        raise SystemExit(1)
-
-    # Create phases directory
-    (cwd / "docs" / "phases").mkdir(exist_ok=True)
-
-    slug = get_slug_from_files(files)
-
-    prompt = PROMPTS["phases"].format(
-        roadmap_path=files["roadmap"].relative_to(cwd),
-        slug=slug,
-    )
-
-    console.print(Panel(
-        f"[yellow]Reading:[/yellow] {files['roadmap'].name}",
-        title="Phase 3: Phase Files",
-    ))
-    console.print()
-
-    async def run():
-        info = await run_claude(prompt, cwd)
-        console.print(Panel(
-            f"[green]Phase files complete[/green]\n\n"
-            f"Output: docs/phases/{slug}_PHASE_*.md\n"
-            f"Cost: ${info.get('total_cost_usd', 0):.4f}\n\n"
-            "[dim]Review and edit, then run:[/dim] outer prompt",
-            title="Done",
-        ))
-
-    asyncio.run(run())
-
-
-@cli.command()
-def prompt() -> None:
-    """Phase 4: Generate universal resume prompt."""
-    cwd = Path.cwd()
-    files = find_planning_files(cwd)
-
-    if not files["phase_index"]:
-        console.print("[red]No phase index found in docs/phases/[/red]")
-        console.print("Run 'outer phases' first.")
-        raise SystemExit(1)
-
-    slug = get_slug_from_files(files)
-
-    prompt_text = PROMPTS["resume_prompt"].format(
-        roadmap_path=files["roadmap"].relative_to(cwd) if files["roadmap"] else "docs/ROADMAP.md",
-        slug=slug,
-    )
-
-    console.print(Panel(
-        f"[yellow]Generating resume prompt for:[/yellow] {slug}",
-        title="Phase 4: Resume Prompt",
-    ))
-    console.print()
-
-    async def run():
-        info = await run_claude(prompt_text, cwd)
-        console.print(Panel(
-            f"[green]Resume prompt complete[/green]\n\n"
-            f"Output: docs/{slug}_RESUME_PROMPT.md\n"
-            f"Cost: ${info.get('total_cost_usd', 0):.4f}\n\n"
-            "[dim]Install as slash command:[/dim] outer install\n"
-            "[dim]Or run directly:[/dim] outer run",
-            title="Done",
-        ))
-
-    asyncio.run(run())
-
-
-@cli.command()
-@click.option("--name", "-n", help="Custom command name (default: resume-{slug})")
-def install(name: str | None) -> None:
-    """Install resume prompt as a Claude Code slash command."""
-    cwd = Path.cwd()
-    files = find_planning_files(cwd)
-
-    if not files["resume_prompt"]:
-        console.print("[red]No resume prompt found in docs/[/red]")
-        console.print("Run 'outer prompt' first.")
-        raise SystemExit(1)
-
-    slug = get_slug_from_files(files)
-    cmd_name = name or f"resume-{slug.replace('_', '-')}"
-
-    # Create command directory and file
-    commands_dir = cwd / ".claude" / "commands"
-    commands_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd_file = commands_dir / f"{cmd_name}.md"
-    cmd_file.write_text(files["resume_prompt"].read_text())
-
-    console.print(Panel(
-        f"[green]Slash command installed![/green]\n\n"
-        f"Command: [cyan]/{cmd_name}[/cyan]\n"
-        f"File: .claude/commands/{cmd_name}.md\n\n"
-        "Usage:\n"
-        "  1. Start fresh Claude Code session\n"
-        f"  2. Type [cyan]/{cmd_name}[/cyan]\n"
-        "  3. Work resumes automatically\n\n"
-        "Kill/restart freely - use the command each time.",
-        title="Installed",
-    ))
-
-
-@cli.command()
-@click.option("--max-turns", "-t", type=int, help="Maximum turns for the session")
-def run(max_turns: int | None) -> None:
-    """Execute work using the resume prompt."""
-    cwd = Path.cwd()
-    files = find_planning_files(cwd)
-
-    if not files["resume_prompt"]:
-        console.print("[red]No resume prompt found in docs/[/red]")
-        console.print("Run 'outer prompt' first.")
-        raise SystemExit(1)
-
-    prompt_text = files["resume_prompt"].read_text()
-
-    console.print(Panel(
-        "[yellow]Starting work session...[/yellow]",
-        title="Run",
-    ))
-    console.print()
-
-    async def execute():
-        info = await run_claude(prompt_text, cwd, max_turns=max_turns)
-        console.print(Panel(
-            f"[green]Session complete[/green]\n\n"
-            f"Cost: ${info.get('total_cost_usd', 0):.4f}\n"
-            f"Turns: {info.get('num_turns', 0)}\n\n"
-            "Progress saved to phase files.\n"
-            "[dim]Continue with:[/dim] outer run",
-            title="Done",
-        ))
-
-    asyncio.run(execute())
-
-
-@cli.command()
-def status() -> None:
-    """Show current planning workflow status."""
-    cwd = Path.cwd()
-    files = find_planning_files(cwd)
-    slug = get_slug_from_files(files)
-
-    phases = [
-        ("Architecture", files["architecture"]),
-        ("Roadmap", files["roadmap"]),
-        ("Phase Files", files["phase_index"]),
-        ("Resume Prompt", files["resume_prompt"]),
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
     ]
 
-    lines = []
-    for name, path in phases:
-        if path:
-            lines.append(f"  [green]✓[/green] {name}: {path.relative_to(cwd)}")
-        else:
-            lines.append(f"  [dim]•[/dim] {name}")
+    def compose(self) -> ComposeResult:
+        with Vertical(id="plan-dialog"):
+            yield Label("Enter project description:", id="plan-label")
+            yield Input(placeholder="e.g., Add user authentication with OAuth", id="plan-input")
+            with Horizontal(id="plan-buttons"):
+                yield Button("Start Planning", variant="primary", id="plan-submit")
+                yield Button("Cancel", variant="default", id="plan-cancel")
 
-    # Check for slash command
-    if slug:
-        cmd_file = cwd / ".claude" / "commands" / f"resume-{slug.replace('_', '-')}.md"
-        if cmd_file.exists():
-            lines.append(f"  [green]✓[/green] Slash command: /{cmd_file.stem}")
-        else:
-            lines.append(f"  [dim]•[/dim] Slash command")
+    def on_mount(self) -> None:
+        self.query_one("#plan-input", Input).focus()
 
-    title = slug or "No project found"
-    console.print(Panel("\n".join(lines), title=title))
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "plan-submit":
+            value = self.query_one("#plan-input", Input).value.strip()
+            if value:
+                self.dismiss(value)
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.value.strip():
+            self.dismiss(event.value.strip())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ============================================================================
+# Main Application
+# ============================================================================
+
+class OuterApp(App):
+    """Main TUI application for Outer workflow orchestration."""
+
+    CSS = """
+    #plan-dialog {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #plan-label {
+        margin-bottom: 1;
+    }
+
+    #plan-input {
+        margin-bottom: 1;
+    }
+
+    #plan-buttons {
+        height: 3;
+        align: center middle;
+    }
+
+    #plan-buttons Button {
+        margin: 0 1;
+    }
+
+    #sidebar {
+        width: 32;
+        background: $surface;
+        border-right: solid $primary;
+        padding: 1;
+    }
+
+    #main {
+        width: 1fr;
+    }
+
+    #output {
+        height: 1fr;
+        border: solid $primary;
+        padding: 0 1;
+    }
+
+    #status-panel {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #status-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .status-item {
+        height: 1;
+    }
+
+    .status-done {
+        color: $success;
+    }
+
+    .status-pending {
+        color: $text-muted;
+    }
+
+    #actions {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #actions-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #actions Button {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #info-panel {
+        height: auto;
+        margin-top: 1;
+        padding-top: 1;
+        border-top: solid $primary;
+    }
+
+    #info-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .info-item {
+        color: $text-muted;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("1", "run_plan", "Plan"),
+        Binding("2", "run_roadmap", "Roadmap"),
+        Binding("3", "run_phases", "Phases"),
+        Binding("4", "run_prompt", "Prompt"),
+        Binding("5", "run_install", "Install"),
+        Binding("6", "run_execute", "Run"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("c", "clear_output", "Clear"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.cwd = Path.cwd()
+        self.files: dict[str, Path | None] = {}
+        self.slug: str | None = None
+        self.running = False
+        self.total_cost = 0.0
+        self.total_turns = 0
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            with Vertical(id="sidebar"):
+                with Vertical(id="status-panel"):
+                    yield Static("Status", id="status-title")
+                    yield Static("• Architecture", id="status-arch", classes="status-item status-pending")
+                    yield Static("• Roadmap", id="status-road", classes="status-item status-pending")
+                    yield Static("• Phases", id="status-phases", classes="status-item status-pending")
+                    yield Static("• Prompt", id="status-prompt", classes="status-item status-pending")
+                    yield Static("• Installed", id="status-install", classes="status-item status-pending")
+                with Vertical(id="actions"):
+                    yield Static("Actions", id="actions-title")
+                    yield Button("1. Plan", id="btn-plan")
+                    yield Button("2. Roadmap", id="btn-roadmap")
+                    yield Button("3. Phases", id="btn-phases")
+                    yield Button("4. Prompt", id="btn-prompt")
+                    yield Button("5. Install", id="btn-install")
+                    yield Button("6. Run", id="btn-run", variant="primary")
+                with Vertical(id="info-panel"):
+                    yield Static("Session", id="info-title")
+                    yield Static("Cost: $0.0000", id="info-cost", classes="info-item")
+                    yield Static("Turns: 0", id="info-turns", classes="info-item")
+            with Vertical(id="main"):
+                yield RichLog(id="output", highlight=True, markup=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_status()
+        self.log_message("[bold]Outer[/bold] - Claude Code Planning Workflow\n")
+        self.log_message(f"Working directory: {self.cwd}\n")
+        if self.slug:
+            self.log_message(f"Project: [cyan]{self.slug}[/cyan]\n")
+        else:
+            self.log_message("No project found. Press [bold]1[/bold] to start planning.\n")
+
+    def refresh_status(self) -> None:
+        """Refresh the status display."""
+        self.files = find_planning_files(self.cwd)
+        self.slug = get_slug_from_files(self.files)
+
+        # Update status indicators
+        items = [
+            ("status-arch", "architecture", "Architecture"),
+            ("status-road", "roadmap", "Roadmap"),
+            ("status-phases", "phase_index", "Phases"),
+            ("status-prompt", "resume_prompt", "Prompt"),
+        ]
+
+        for widget_id, file_key, label in items:
+            widget = self.query_one(f"#{widget_id}", Static)
+            if self.files[file_key]:
+                widget.update(f"[green]✓[/green] {label}")
+                widget.remove_class("status-pending")
+                widget.add_class("status-done")
+            else:
+                widget.update(f"• {label}")
+                widget.remove_class("status-done")
+                widget.add_class("status-pending")
+
+        # Check slash command
+        install_widget = self.query_one("#status-install", Static)
+        if self.slug:
+            cmd_file = self.cwd / ".claude" / "commands" / f"resume-{self.slug.replace('_', '-')}.md"
+            if cmd_file.exists():
+                install_widget.update("[green]✓[/green] Installed")
+                install_widget.remove_class("status-pending")
+                install_widget.add_class("status-done")
+            else:
+                install_widget.update("• Installed")
+                install_widget.remove_class("status-done")
+                install_widget.add_class("status-pending")
+
+        # Update title
+        title = self.slug or "No project"
+        self.title = f"Outer - {title}"
+
+    def log_message(self, message: str) -> None:
+        """Write a message to the output log."""
+        self.query_one("#output", RichLog).write(message)
+
+    def update_info(self, cost: float, turns: int) -> None:
+        """Update session info display."""
+        self.total_cost += cost
+        self.total_turns += turns
+        self.query_one("#info-cost", Static).update(f"Cost: ${self.total_cost:.4f}")
+        self.query_one("#info-turns", Static).update(f"Turns: {self.total_turns}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses."""
+        if self.running:
+            self.log_message("[yellow]Session already running...[/yellow]\n")
+            return
+
+        actions = {
+            "btn-plan": self.action_run_plan,
+            "btn-roadmap": self.action_run_roadmap,
+            "btn-phases": self.action_run_phases,
+            "btn-prompt": self.action_run_prompt,
+            "btn-install": self.action_run_install,
+            "btn-run": self.action_run_execute,
+        }
+        action = actions.get(event.button.id)
+        if action:
+            action()
+
+    def action_refresh(self) -> None:
+        """Refresh status display."""
+        self.refresh_status()
+        self.log_message("[dim]Status refreshed[/dim]\n")
+
+    def action_clear_output(self) -> None:
+        """Clear the output log."""
+        self.query_one("#output", RichLog).clear()
+
+    def action_run_plan(self) -> None:
+        """Start the planning phase."""
+        if self.running:
+            return
+
+        def handle_result(result: str | None) -> None:
+            if result:
+                self.run_phase_plan(result)
+
+        self.push_screen(PlanInputScreen(), handle_result)
+
+    def action_run_roadmap(self) -> None:
+        """Run the roadmap phase."""
+        if self.running:
+            return
+        if not self.files["architecture"]:
+            self.log_message("[red]No architecture file found. Run Plan first.[/red]\n")
+            return
+        self.run_phase_roadmap()
+
+    def action_run_phases(self) -> None:
+        """Run the phases generation."""
+        if self.running:
+            return
+        if not self.files["roadmap"]:
+            self.log_message("[red]No roadmap file found. Run Roadmap first.[/red]\n")
+            return
+        self.run_phase_phases()
+
+    def action_run_prompt(self) -> None:
+        """Run the prompt generation."""
+        if self.running:
+            return
+        if not self.files["phase_index"]:
+            self.log_message("[red]No phase files found. Run Phases first.[/red]\n")
+            return
+        self.run_phase_prompt()
+
+    def action_run_install(self) -> None:
+        """Install the slash command."""
+        if self.running:
+            return
+        if not self.files["resume_prompt"]:
+            self.log_message("[red]No resume prompt found. Run Prompt first.[/red]\n")
+            return
+
+        cmd_name = f"resume-{self.slug.replace('_', '-')}"
+        commands_dir = self.cwd / ".claude" / "commands"
+        commands_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd_file = commands_dir / f"{cmd_name}.md"
+        cmd_file.write_text(self.files["resume_prompt"].read_text())
+
+        self.log_message(f"[green]✓[/green] Installed slash command: [cyan]/{cmd_name}[/cyan]\n")
+        self.refresh_status()
+
+    def action_run_execute(self) -> None:
+        """Execute work using resume prompt."""
+        if self.running:
+            return
+        if not self.files["resume_prompt"]:
+            self.log_message("[red]No resume prompt found. Run Prompt first.[/red]\n")
+            return
+        self.run_phase_execute()
+
+    @work(exclusive=True)
+    async def run_phase_plan(self, description: str) -> None:
+        """Run the architecture planning phase."""
+        self.running = True
+        self.log_message(f"\n[bold cyan]Phase 1: Architecture[/bold cyan]\n")
+        self.log_message(f"Planning: {description}\n\n")
+
+        # Ensure docs directory exists
+        (self.cwd / "docs").mkdir(exist_ok=True)
+
+        slug = slugify(description)[:30]
+        prompt = PROMPTS["architecture"].format(description=description, slug=slug)
+
+        info = await self._run_claude(prompt)
+        self.update_info(info.get("total_cost_usd", 0) or 0, info.get("num_turns", 0))
+
+        self.log_message(f"\n[green]✓[/green] Architecture complete: docs/{slug}_ARCHITECTURE.md\n")
+        self.refresh_status()
+        self.running = False
+
+    @work(exclusive=True)
+    async def run_phase_roadmap(self) -> None:
+        """Run the roadmap generation phase."""
+        self.running = True
+        self.log_message(f"\n[bold cyan]Phase 2: Roadmap[/bold cyan]\n")
+        self.log_message(f"Reading: {self.files['architecture'].name}\n\n")
+
+        prompt = PROMPTS["roadmap"].format(
+            arch_path=self.files["architecture"].relative_to(self.cwd),
+            slug=self.slug,
+        )
+
+        info = await self._run_claude(prompt)
+        self.update_info(info.get("total_cost_usd", 0) or 0, info.get("num_turns", 0))
+
+        self.log_message(f"\n[green]✓[/green] Roadmap complete: docs/{self.slug}_ROADMAP.md\n")
+        self.refresh_status()
+        self.running = False
+
+    @work(exclusive=True)
+    async def run_phase_phases(self) -> None:
+        """Run the phase files generation."""
+        self.running = True
+        self.log_message(f"\n[bold cyan]Phase 3: Phase Files[/bold cyan]\n")
+        self.log_message(f"Reading: {self.files['roadmap'].name}\n\n")
+
+        (self.cwd / "docs" / "phases").mkdir(exist_ok=True)
+
+        prompt = PROMPTS["phases"].format(
+            roadmap_path=self.files["roadmap"].relative_to(self.cwd),
+            slug=self.slug,
+        )
+
+        info = await self._run_claude(prompt)
+        self.update_info(info.get("total_cost_usd", 0) or 0, info.get("num_turns", 0))
+
+        self.log_message(f"\n[green]✓[/green] Phase files complete: docs/phases/{self.slug}_PHASE_*.md\n")
+        self.refresh_status()
+        self.running = False
+
+    @work(exclusive=True)
+    async def run_phase_prompt(self) -> None:
+        """Run the resume prompt generation."""
+        self.running = True
+        self.log_message(f"\n[bold cyan]Phase 4: Resume Prompt[/bold cyan]\n\n")
+
+        roadmap_path = self.files["roadmap"].relative_to(self.cwd) if self.files["roadmap"] else "docs/ROADMAP.md"
+
+        prompt = PROMPTS["resume_prompt"].format(
+            roadmap_path=roadmap_path,
+            slug=self.slug,
+        )
+
+        info = await self._run_claude(prompt)
+        self.update_info(info.get("total_cost_usd", 0) or 0, info.get("num_turns", 0))
+
+        self.log_message(f"\n[green]✓[/green] Resume prompt complete: docs/{self.slug}_RESUME_PROMPT.md\n")
+        self.refresh_status()
+        self.running = False
+
+    @work(exclusive=True)
+    async def run_phase_execute(self) -> None:
+        """Execute work using the resume prompt."""
+        self.running = True
+        self.log_message(f"\n[bold cyan]Executing Work[/bold cyan]\n\n")
+
+        prompt = self.files["resume_prompt"].read_text()
+
+        info = await self._run_claude(prompt)
+        self.update_info(info.get("total_cost_usd", 0) or 0, info.get("num_turns", 0))
+
+        self.log_message(f"\n[green]✓[/green] Session complete\n")
+        self.refresh_status()
+        self.running = False
+
+    async def _run_claude(self, prompt: str) -> dict[str, Any]:
+        """Run a Claude Code session and stream output to the log."""
+        options = ClaudeCodeOptions(
+            cwd=str(self.cwd),
+            permission_mode="bypassPermissions",
+        )
+
+        result_info: dict[str, Any] = {}
+        output = self.query_one("#output", RichLog)
+
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        output.write(block.text)
+                    elif isinstance(block, ToolUseBlock):
+                        output.write(f"[dim]> {block.name}[/dim]")
+            elif isinstance(message, ResultMessage):
+                result_info = {
+                    "duration_ms": message.duration_ms,
+                    "num_turns": message.num_turns,
+                    "total_cost_usd": message.total_cost_usd,
+                    "session_id": message.session_id,
+                    "is_error": message.is_error,
+                }
+
+        return result_info
 
 
 def main():
-    cli()
+    app = OuterApp()
+    app.run()
 
 
 if __name__ == "__main__":
