@@ -1,0 +1,20 @@
+[project]
+name = "outer"
+version = "0.1.0"
+description = "Meta-workflow orchestrator for Claude Code planning sessions"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "claude-code-sdk>=0.0.25",
+    "click>=8.3.1",
+    "rich>=14.2.0",
+]
+
+[project.scripts]
+outer = "outer:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
